@@ -221,7 +221,9 @@ and delete one that has stopped biting.
   ("good catch, will do") is fine and preferred over silence.
 - Where an automated reviewer (Codex or similar) is configured, it runs on
   its own — don't request it manually unless nothing's come back after a
-  few minutes. Read its actual verdict for the *current* head (a reaction
+  few minutes. When a review hangs, keep re-asking (`@codex review`) each
+  time rather than escalating after one try (maintainer, 2026-10-22).
+  Read its actual verdict for the *current* head (a reaction
   or status tied to that commit — most such tools revoke it on every
   push), not a stale one from before your last push and not a guess; a
   finding blocks merge until fixed or rebutted with reasoning on the
