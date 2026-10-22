@@ -7,16 +7,22 @@ Edit `AGENTS.md`.
 
 ## What this repository is
 
-TODO: one paragraph -- what it does, what it is built with, and what a
-reader has to know before changing anything. Name the normative documents
-(`SPEC.md`, `TODO.md`, `README.md`) if there are any.
+`uswitch` switches Dell monitors over DDC/CI to this machine's input when
+this machine should have them: a USB switch hands it its devices, it boots
+or resumes behind a monitor that is its own KVM, or a shortcut asks. Linux
+and systemd only; one Python 3.10+ file, standard library only, with
+`ddcutil` as its one external binary. `SPEC.md` is the normative contract:
+a change to what uswitch does, what it waits on, or how a trigger reaches
+it changes `SPEC.md` first. The repository was `udevswitch` until it was
+renamed; GitHub redirects the old URL.
 
 ## Building and testing
 
-TODO: the commands a contributor actually runs, and which one of them to
-run before every commit. `.github/workflows/ci.yml` ships with a
-placeholder job standing in for this project's real ones -- replacing it
-and describing it here are the same task.
+No code yet: the first build follows `SPEC.md`'s Phase 0 hardware check.
+Tests will be `unittest`, run by `make test`, before every commit.
+`.github/workflows/ci.yml` still runs its placeholder job; the first build
+PR replaces it with `make test`. Hardware behavior (real udev, monitors,
+the USB switch) can't run in CI; say what was verified by unit test only.
 
 ## Everything below
 
