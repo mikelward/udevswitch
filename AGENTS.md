@@ -18,11 +18,13 @@ renamed; GitHub redirects the old URL.
 
 ## Building and testing
 
-No code yet: the first build follows `SPEC.md`'s Phase 0 hardware check.
-Tests will be `unittest`, run by `make test`, before every commit.
-`.github/workflows/ci.yml` still runs its placeholder job; the first build
-PR replaces it with `make test`. Hardware behavior (real udev, monitors,
-the USB switch) can't run in CI; say what was verified by unit test only.
+`make test` runs the `unittest` suite; run it before every commit. CI runs
+it on Python 3.10 (the floor) and current. Tests load `uswitch` from its
+path and stand in for the outside world through `Context`: a fake sysfs
+tree, a clock that moves only when uswitch sleeps, and a runner that
+emulates `ddcutil` (`tests/support.py`); no test sleeps or needs root.
+Hardware behavior (real udev, monitors, the USB switch) can't run in CI;
+say what was verified by unit test only.
 
 ## Everything below
 
