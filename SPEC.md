@@ -142,8 +142,10 @@ to whichever input just found a signal. Turn both off (see *Setup*).
 ### D6. Monitors are identified by EDID, never by display or bus number
 
 ddcutil's display numbers and the kernel's I2C bus numbers shift with plug order and
-across boots; a monitor's EDID manufacturer, model and serial don't. Configuration and
-every switch use the EDID; one whose EDID has no serial is identified by the whole EDID. A
+across boots; a monitor's EDID manufacturer, model and serial don't. The kernel's DRM
+connectors say which monitors are connected and give each one's EDID with no DDC/CI
+traffic; a laptop's own panel is never part of a desk. Configuration and every switch use
+the EDID; one whose EDID has no serial is identified by the whole EDID. A
 configured monitor that doesn't appear within its wait (D12), the laptop at another desk
 say, is skipped with a log line, not an error.
 
@@ -177,15 +179,16 @@ Every trigger starts the same `uswitch.service`, so they run the same check (D11
 the same, and fold together when they coincide.
 
 - **`usb`** (setup A): a configured trigger device arrives (D1).
-- **`wake`**: the machine boots or resumes from suspend or hibernation. On by default. At a
-  setup A desk a wake switches only while the desk's trigger device is present (D11), so a
-  machine the switch doesn't point at never takes the display, and a switch whose devices
-  stayed connected through the suspend still switches. At a setup B desk every wake
-  switches, including wakes nobody asked for, like a timer or a laptop waking when its
-  charger goes in; the monitor's KVM then moves the keyboard and mouse too, and getting
-  back to a desktop means the monitor's buttons. Turn it off with `enabled = no` and
-  rerun `sudo uswitch install`, which unhooks the unit from boot and resume. A laptop that
-  stays awake with its lid shut never wakes; the manual trigger covers it.
+- **`wake`**: the machine boots (once the rest of boot is done, so boot never waits on it)
+  or resumes from suspend or hibernation. On by default. At a setup A desk a wake switches
+  only while the desk's trigger device is present (D11), so a machine the switch doesn't
+  point at never takes the display, and a switch whose devices stayed connected through
+  the suspend still switches. At a setup B desk every wake switches, including wakes
+  nobody asked for, like a timer or a laptop waking when its charger goes in; the
+  monitor's KVM then moves the keyboard and mouse too, and getting back to a desktop means
+  the monitor's buttons. Turn it off with `enabled = no` and rerun `sudo uswitch install`,
+  which unhooks the unit from boot and resume. A laptop that stays awake with its lid shut
+  never wakes; the manual trigger covers it.
 - **manual**: a keyboard shortcut running `systemctl start uswitch.service`, which a
   polkit rule `install` writes lets the active local user start without a password;
   switching inputs is the whole of what it grants. At a setup A desk it does nothing while
@@ -212,7 +215,8 @@ belongs to one desk; learning it at another moves it there.
 Nothing in uswitch sleeps a fixed time hoping the hardware is ready. Every wait is for
 something it can observe, polled under a bound, and the journal records how long each took,
 so slow hardware shows up as numbers rather than as switching that works most of the time.
-Phase 0 measures what the bounds need. The orderings it respects:
+Phase 0 measures what the bounds need; until it reports, they are provisional defaults in
+the code. The orderings it respects:
 
 - **The monitor must be reachable before a write.** At boot the trigger's coldplug event
   can come before the GPU driver and `i2c-dev` are up; after a resume the display link and
@@ -233,8 +237,11 @@ Phase 0 measures what the bounds need. The orderings it respects:
   back to.
 - **A trigger during a run is not lost.** systemd folds a start into a run already in
   progress, so a run continues until every connected monitor shows this machine or its
-  bound runs out, writing only while the desk check passes. A press away and back within
-  that window is handled by the run already going.
+  bound runs out, writing only while the desk check passes, and looks once more before it
+  ends. It recognizes a press away and back by the switch's hub re-enumerating (its USB
+  device number changes), not by happening to look while the hub was gone, so a press
+  during a slow DDC/CI call to another monitor still sends every monitor at that desk back
+  to this machine.
 - Whether to switch several monitors in parallel waits on Phase 0's timings. ddcutil keeps
   the protocol's own delays between commands.
 
@@ -385,6 +392,8 @@ binary. The configuration is read and written with `configparser`.
 
 - A write stuck in ddcutil for longer than the other machine's whole run can still land
   last and leave the monitors on the machine you left (D12). Press again.
+- Two identical monitors without an EDID serial can't be told apart; `learn` keeps one
+  (D6).
 - Daisy-chained (DisplayPort MST) monitors aren't covered: switching the nearer one can cut
   the farther one's signal.
 - In setup B, `wake` can't tell a wake you asked for from one you didn't (D10).

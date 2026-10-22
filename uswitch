@@ -1,0 +1,1204 @@
+#!/usr/bin/env python3
+"""uswitch: switch monitors to this machine over DDC/CI when it should have them.
+
+SPEC.md is the contract. Decision numbers (D1, D2, ...) below refer to it.
+"""
+
+import argparse
+import configparser
+import dataclasses
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+
+INPUT_SOURCE = "60"
+
+CONFIG = "etc/uswitch.conf"
+PROGRAM = "usr/local/sbin/uswitch"
+UDEV_RULE = "etc/udev/rules.d/90-uswitch.rules"
+UNIT = "etc/systemd/system/uswitch.service"
+POLKIT_RULE = "etc/polkit-1/rules.d/50-uswitch.rules"
+MODULES_LOAD = "etc/modules-load.d/uswitch.conf"
+UNIT_NAME = "uswitch.service"
+SLEEP_TARGETS = (
+    "suspend.target",
+    "hibernate.target",
+    "hybrid-sleep.target",
+    "suspend-then-hibernate.target",
+)
+
+# Connectors of a laptop's own panel: no DDC/CI, and never part of a desk.
+INTERNAL_CONNECTORS = ("eDP", "LVDS", "DSI")
+
+# MCCS names for display only (D8); Dell puts USB-C at 0x1b.
+INPUT_NAMES = {
+    0x01: "VGA-1",
+    0x02: "VGA-2",
+    0x03: "DVI-1",
+    0x04: "DVI-2",
+    0x0F: "DisplayPort-1",
+    0x10: "DisplayPort-2",
+    0x11: "HDMI-1",
+    0x12: "HDMI-2",
+    0x1B: "USB-C",
+}
+
+DDCUTIL_PACKAGE_HINT = "install the ddcutil package (apt install ddcutil, or dnf install ddcutil)"
+
+HEX4 = re.compile(r"[0-9a-f]{4}")
+PORT = re.compile(r"\d+-\d+(\.\d+)*")
+DESK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# A value safe inside a quoted udev match: printable ASCII with no quote,
+# backslash or glob character, which would widen the match (D1).
+UDEV_SAFE = re.compile(r"[\x20-\x7e]+")
+UDEV_UNSAFE_CHARS = set('"\\*?[]|')
+
+
+class UswitchError(Exception):
+    """A failure to report to the user and exit on, with `code` as the status."""
+
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+class MissingCommand(UswitchError):
+    pass
+
+
+@dataclass(frozen=True)
+class Timing:
+    """The bounds every wait runs under (D12). Provisional until SPEC.md's
+    Phase 0 measures real hardware; tune them from its numbers."""
+
+    appear: float = 30.0  # for a configured monitor's EDID, after boot or resume
+    run: float = 45.0  # a whole switch run, so a trigger returning mid-run is caught
+    settle: float = 5.0  # after a write, before writing again or calling it unconfirmed
+    poll: float = 0.25  # between checks
+    learn_press: float = 120.0  # learn: for the devices to leave, then to return
+    learn_return_grace: float = 5.0  # learn: after the first returns, for the rest
+    learn_away: float = 30.0  # learn: for each monitor to leave this machine's input
+    command: float = 20.0  # one ddcutil, systemctl, udevadm or modprobe call
+
+
+class Clock:
+    def now(self):
+        return time.monotonic()
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+
+@dataclass
+class Result:
+    returncode: int
+    stdout: str
+    stderr: str
+
+    def message(self):
+        text = (self.stderr.strip() or self.stdout.strip()).splitlines()
+        return text[0] if text else f"exit status {self.returncode}"
+
+
+def run_command(argv, timeout):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        raise MissingCommand(f"{argv[0]} not found")
+    except subprocess.TimeoutExpired:
+        return Result(124, "", f"{argv[0]} timed out after {timeout:g}s")
+    return Result(p.returncode, p.stdout, p.stderr)
+
+
+@dataclass
+class Context:
+    """Everything uswitch touches outside itself, so tests can stand it in."""
+
+    root: str = "/"
+    sysfs: str = "/sys"
+    clock: Clock = field(default_factory=Clock)
+    run: object = run_command
+    which: object = shutil.which
+    euid: int = field(default_factory=os.geteuid)
+    stdin: object = sys.stdin
+    stdout: object = sys.stdout
+    stderr: object = sys.stderr
+    timing: Timing = field(default_factory=Timing)
+    self_path: str = os.path.abspath(__file__)
+
+    @property
+    def live(self):
+        """Whether this is the running system, rather than a root to write into."""
+        return self.root == "/"
+
+    def path(self, rel):
+        return os.path.join(self.root, rel)
+
+    def say(self, message):
+        print(message, file=self.stdout, flush=True)
+
+    def warn(self, message):
+        print(f"uswitch: {message}", file=self.stderr, flush=True)
+
+    def ask(self, prompt, default=""):
+        shown = f"{prompt} [{default}] " if default else f"{prompt} "
+        print(shown, end="", file=self.stdout, flush=True)
+        line = self.stdin.readline()
+        if not line:
+            raise UswitchError("learn needs a terminal to answer its questions")
+        return line.strip() or default
+
+    def command(self, argv):
+        return self.run(argv, self.timing.command)
+
+
+def require_root(ctx):
+    if ctx.live and ctx.euid != 0:
+        raise UswitchError("this needs root: run it with sudo")
+
+
+def input_name(value):
+    if value is None:
+        return "unknown"
+    name = INPUT_NAMES.get(value)
+    return f"0x{value:02x} ({name})" if name else f"0x{value:02x}"
+
+
+# --- EDID and connected monitors (D6) ----------------------------------------
+
+EDID_HEADER = bytes([0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+
+
+@dataclass(frozen=True)
+class Edid:
+    mfg: str
+    model: str
+    serial: str
+    raw: bytes
+
+    @property
+    def hex(self):
+        return self.raw.hex()
+
+
+def _edid_text(block):
+    text = block[5:18].split(b"\n", 1)[0]
+    return "".join(chr(b) if 0x20 <= b < 0x7F else "?" for b in text).strip()
+
+
+def parse_edid(data):
+    """The identity in an EDID, or None if `data` isn't one."""
+    if len(data) < 128 or data[:8] != EDID_HEADER:
+        return None
+    v = data[8] << 8 | data[9]
+    mfg = "".join(chr(((v >> shift) & 0x1F) + 64) for shift in (10, 5, 0))
+    model = serial = ""
+    for offset in (54, 72, 90, 108):
+        block = data[offset : offset + 18]
+        if block[0] == 0 and block[1] == 0 and block[2] == 0:
+            if block[3] == 0xFC:
+                model = _edid_text(block)
+            elif block[3] == 0xFF:
+                serial = _edid_text(block)
+    return Edid(mfg, model, serial, bytes(data[:128]))
+
+
+@dataclass(frozen=True)
+class Connector:
+    """A connected external monitor as the kernel's DRM layer sees it."""
+
+    name: str
+    edid: Edid
+    bus: object  # the connector's own I2C bus number, when the driver exposes it
+
+    def ddcutil_args(self):
+        # The connector's own bus is fastest; the EDID is exact otherwise.
+        if self.bus is not None:
+            return ["--bus", str(self.bus)]
+        return ["--edid", self.edid.hex]
+
+
+def _read(path, mode="r"):
+    with open(path, mode) as f:
+        return f.read()
+
+
+def _connector_bus(path):
+    ddc = os.path.join(path, "ddc")
+    candidates = []
+    if os.path.islink(ddc):
+        candidates.append(os.path.basename(os.readlink(ddc)))
+    try:
+        candidates += sorted(n for n in os.listdir(path) if n.startswith("i2c-"))
+    except OSError:
+        return None  # the connector vanished mid-hotplug; the caller re-polls
+    for name in candidates:
+        m = re.fullmatch(r"i2c-(\d+)", name)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def connected_monitors(sysfs):
+    """Every connected external monitor with a readable EDID."""
+    base = os.path.join(sysfs, "class", "drm")
+    try:
+        names = sorted(os.listdir(base))
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        if "-" not in name:
+            continue  # card0 itself, renderD128
+        if name.split("-", 1)[1].startswith(INTERNAL_CONNECTORS):
+            continue
+        path = os.path.join(base, name)
+        try:
+            if _read(os.path.join(path, "status")).strip() != "connected":
+                continue
+            edid = parse_edid(_read(os.path.join(path, "edid"), "rb"))
+        except OSError:
+            continue  # sysfs entries come and go during hotplug; the caller re-polls
+        if edid is not None:
+            found.append(Connector(name, edid, _connector_bus(path)))
+    return found
+
+
+# --- USB devices (D1) --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UsbDevice:
+    port: str  # the kernel name, which is its port path: "3-2", "3-2.1"
+    vendor: str
+    product: str
+    serial: str
+    name: str
+    hub: bool
+    speed: float  # Mb/s
+    # The bus's number for this enumeration: it changes whenever the device
+    # re-enumerates, so a press away and back shows even if nobody saw it gone.
+    devnum: int = field(default=0, compare=False)
+
+    @property
+    def depth(self):
+        return 1 + self.port.count(".")
+
+    def describe(self):
+        serial = f" serial {self.serial}" if self.serial else ""
+        name = f" {self.name}" if self.name else ""
+        return f"{self.vendor}:{self.product}{serial} at {self.port}{name}"
+
+
+def _attr(path, name):
+    try:
+        return _read(os.path.join(path, name)).strip()
+    except OSError:
+        return ""  # an optional attribute (serial, product strings) a device needn't have
+
+
+def usb_devices(sysfs):
+    """Every USB device but root hubs, by port."""
+    base = os.path.join(sysfs, "bus", "usb", "devices")
+    try:
+        names = os.listdir(base)
+    except FileNotFoundError:
+        return {}
+    devices = {}
+    for name in names:
+        if ":" in name or name.startswith("usb") or not PORT.fullmatch(name):
+            continue  # interfaces, and root hubs, which never come and go with a switch
+        path = os.path.join(base, name)
+        vendor = _attr(path, "idVendor")
+        if not vendor:
+            continue  # gone between the listing and the read
+        try:
+            speed = float(_attr(path, "speed") or 0)
+        except ValueError:
+            speed = 0.0
+        label = " ".join(s for s in (_attr(path, "manufacturer"), _attr(path, "product")) if s)
+        devnum = _attr(path, "devnum")
+        devices[name] = UsbDevice(
+            port=name,
+            vendor=vendor.lower(),
+            product=_attr(path, "idProduct").lower(),
+            serial=_attr(path, "serial"),
+            name=label,
+            hub=_attr(path, "bDeviceClass") == "09",
+            speed=speed,
+            devnum=int(devnum) if devnum.isdigit() else 0,
+        )
+    return devices
+
+
+def udev_safe(value):
+    return bool(UDEV_SAFE.fullmatch(value)) and not (set(value) & UDEV_UNSAFE_CHARS)
+
+
+@dataclass(frozen=True)
+class UsbTrigger:
+    vendor: str
+    product: str
+    serial: str = ""
+    port: str = ""
+
+    def matches(self, device):
+        return (
+            device.vendor == self.vendor
+            and device.product == self.product
+            and (not self.serial or device.serial == self.serial)
+            and (not self.port or device.port == self.port)
+        )
+
+    def present(self, devices):
+        return any(self.matches(d) for d in devices.values())
+
+    def generation(self, devices):
+        """Which enumeration of the trigger is here: empty when it's absent, and
+        different after any press away and back, however brief (D12)."""
+        return frozenset((d.port, d.devnum) for d in devices.values() if self.matches(d))
+
+    def describe(self):
+        parts = [f"{self.vendor}:{self.product}"]
+        if self.serial:
+            parts.append(f"serial {self.serial}")
+        if self.port:
+            parts.append(f"port {self.port}")
+        return " ".join(parts)
+
+    def validate(self, where):
+        if not HEX4.fullmatch(self.vendor) or not HEX4.fullmatch(self.product):
+            raise UswitchError(f"{where}: usb_vendor and usb_product must be four hex digits")
+        if self.serial and not udev_safe(self.serial):
+            raise UswitchError(f"{where}: usb_serial has characters a udev rule can't match safely")
+        if self.port and not PORT.fullmatch(self.port):
+            raise UswitchError(f"{where}: usb_port must look like 3-2 or 3-2.1")
+
+
+def trigger_for(device, devices):
+    """The trigger matching `device` alone among `devices` (D1)."""
+    serial = device.serial if device.serial and udev_safe(device.serial) else ""
+    trigger = UsbTrigger(device.vendor, device.product, serial)
+    others = [d for d in devices.values() if d.port != device.port and trigger.matches(d)]
+    if others or (device.serial and not serial):
+        trigger = dataclasses.replace(trigger, port=device.port)
+    return trigger
+
+
+def trigger_candidates(returned):
+    """The devices that left and came back closest to the root port,
+    preferring a hub, and of a USB 3 hub's pair the USB 2 half (D1, D2)."""
+    if not returned:
+        return []
+    depth = min(d.depth for d in returned)
+    top = [d for d in returned if d.depth == depth]
+    hubs = [d for d in top if d.hub]
+    top = hubs or top
+    slow = [d for d in top if 0 < d.speed <= 480]
+    return sorted(slow or top, key=lambda d: d.port)
+
+
+# --- Configuration (D11) -----------------------------------------------------
+
+
+@dataclass
+class Monitor:
+    label: str
+    desk: str
+    mfg: str
+    model: str
+    serial: str
+    edid: str  # the whole EDID in hex, the identity when there is no serial
+    input: int
+
+    def matches(self, edid):
+        if self.serial:
+            return (edid.mfg, edid.model, edid.serial) == (self.mfg, self.model, self.serial)
+        return edid.hex == self.edid
+
+    def same_monitor(self, other):
+        if self.serial or other.serial:
+            return (self.mfg, self.model, self.serial) == (other.mfg, other.model, other.serial)
+        return self.edid == other.edid
+
+
+def monitor_from_edid(edid, desk, value):
+    # Without a serial the whole EDID is the identity, so the label hashes all of it:
+    # two same-model monitors can differ in any byte, the manufacture week say.
+    ident = edid.serial or f"edid {hashlib.sha256(edid.raw).hexdigest()[:12]}"
+    label = re.sub(r"[\[\]]", "", " ".join(s for s in (edid.model or edid.mfg, ident) if s))
+    return Monitor(
+        label=label,
+        desk=desk,
+        mfg=edid.mfg,
+        model=edid.model,
+        serial=edid.serial,
+        edid="" if edid.serial else edid.hex,
+        input=value,
+    )
+
+
+@dataclass
+class Desk:
+    name: str
+    usb: object = None  # a UsbTrigger at a setup A desk; None at setup B
+
+
+@dataclass
+class Config:
+    wake: bool = True
+    desks: dict = field(default_factory=dict)
+    monitors: list = field(default_factory=list)
+
+    def monitors_of(self, desk):
+        return [m for m in self.monitors if m.desk == desk]
+
+
+def load_config(path):
+    """The configuration at `path`, or None if there is none."""
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path) as f:
+            parser.read_file(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, configparser.Error) as e:
+        raise UswitchError(f"can't read {path}: {e}")
+    config = Config()
+    try:
+        if parser.has_section("wake"):
+            config.wake = parser.getboolean("wake", "enabled", fallback=True)
+        for section in parser.sections():
+            kind, _, name = section.partition(" ")
+            values = parser[section]
+            if kind == "desk":
+                if not DESK_NAME.fullmatch(name):
+                    raise UswitchError(f"{path}: [{section}]: desk names are letters, digits, '.', '_', '-'")
+                usb = None
+                if values.get("usb_vendor") or values.get("usb_product"):
+                    usb = UsbTrigger(
+                        values.get("usb_vendor", "").lower(),
+                        values.get("usb_product", "").lower(),
+                        values.get("usb_serial", ""),
+                        values.get("usb_port", ""),
+                    )
+                    usb.validate(f"{path}: [{section}]")
+                config.desks[name] = Desk(name, usb)
+            elif kind == "monitor":
+                config.monitors.append(
+                    Monitor(
+                        label=name,
+                        desk=values.get("desk", ""),
+                        mfg=values.get("mfg", ""),
+                        model=values.get("model", ""),
+                        serial=values.get("serial", ""),
+                        edid=values.get("edid", "").lower(),
+                        input=int(values.get("input", ""), 0),
+                    )
+                )
+            elif section != "wake":
+                raise UswitchError(f"{path}: unknown section [{section}]")
+    except ValueError as e:
+        raise UswitchError(f"{path}: {e}")
+    for m in config.monitors:
+        if m.desk not in config.desks:
+            raise UswitchError(f"{path}: [monitor {m.label}] names desk {m.desk!r}, which has no [desk] section")
+        if not m.serial and not re.fullmatch(r"[0-9a-f]{256}", m.edid):
+            raise UswitchError(f"{path}: [monitor {m.label}] needs a serial or its whole EDID")
+    return config
+
+
+def _clean(value):
+    if "\n" in value or "\r" in value:
+        raise UswitchError(f"refusing to write a value with a line break: {value!r}")
+    return value
+
+
+def config_text(config):
+    lines = [
+        "# Written by uswitch learn: rerun it rather than editing by hand (SPEC.md,",
+        "# Configuration). After changing [wake], rerun `sudo uswitch install`.",
+        "",
+        "[wake]",
+        f"enabled = {'yes' if config.wake else 'no'}",
+    ]
+    for name in sorted(config.desks):
+        desk = config.desks[name]
+        lines += ["", f"[desk {_clean(name)}]"]
+        if desk.usb:
+            lines += [
+                f"usb_vendor = {desk.usb.vendor}",
+                f"usb_product = {desk.usb.product}",
+                f"usb_serial = {_clean(desk.usb.serial)}",
+                f"usb_port = {desk.usb.port}",
+            ]
+        else:
+            lines.append("# No USB switch: the monitor is the switch (setup B).")
+    labels = [m.label for m in config.monitors]
+    if len(set(labels)) != len(labels):
+        raise UswitchError("two monitors would share a [monitor] section; refusing to write the configuration")
+    for m in sorted(config.monitors, key=lambda m: (m.desk, m.label)):
+        lines += [
+            "",
+            f"[monitor {_clean(m.label)}]",
+            f"desk = {m.desk}",
+            f"mfg = {_clean(m.mfg)}",
+            f"model = {_clean(m.model)}",
+            f"serial = {_clean(m.serial)}",
+        ]
+        if m.edid:
+            lines.append(f"edid = {m.edid}")
+        if m.input in INPUT_NAMES:
+            lines.append(f"# {INPUT_NAMES[m.input]}")
+        lines.append(f"input = 0x{m.input:02x}")
+    return "\n".join(lines) + "\n"
+
+
+def write_file(path, text, mode=0o644):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".uswitch-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def replace_desk(config, name, usb, monitors):
+    """`config` with desk `name` holding exactly `monitors` (D11): learning a
+    monitor at another desk moves it, and a desk left empty goes."""
+    kept = [m for m in config.monitors if m.desk != name and not any(m.same_monitor(n) for n in monitors)]
+    for m in monitors:
+        m.desk = name
+    desks = {n: d for n, d in config.desks.items() if n != name}
+    desks[name] = Desk(name, usb)
+    monitors_by_desk = {m.desk for m in kept} | {name}
+    desks = {n: d for n, d in desks.items() if n in monitors_by_desk}
+    return Config(config.wake, desks, kept + list(monitors))
+
+
+# --- Generated system files (D3, D4, D9, D10) ---------------------------------
+
+
+def udev_rules_text(config, systemctl):
+    lines = [
+        "# Written by uswitch learn from /etc/uswitch.conf; rewritten on every learn.",
+        "# One line per learned USB switch: when its hub appears, start uswitch.service",
+        "# (SPEC.md D1, D3). udev never runs uswitch itself.",
+    ]
+    by_line = {}
+    for name in sorted(config.desks):
+        usb = config.desks[name].usb
+        if usb is None:
+            continue
+        usb.validate(f"desk {name}")
+        parts = [
+            'ACTION=="add"',
+            'SUBSYSTEM=="usb"',
+            'ENV{DEVTYPE}=="usb_device"',
+            f'ATTR{{idVendor}}=="{usb.vendor}"',
+            f'ATTR{{idProduct}}=="{usb.product}"',
+        ]
+        if usb.serial:
+            parts.append(f'ATTR{{serial}}=="{usb.serial}"')
+        if usb.port:
+            parts.append(f'KERNEL=="{usb.port}"')
+        parts.append(f'RUN+="{systemctl} --no-block start {UNIT_NAME}"')
+        by_line.setdefault(", ".join(parts), []).append(name)
+    for line, desks in by_line.items():
+        lines += [f"# desk {', '.join(desks)}", line]
+    return "\n".join(lines) + "\n"
+
+
+def unit_text():
+    targets = " ".join(SLEEP_TARGETS)
+    return f"""\
+# Written by uswitch install (SPEC.md D3, D10). Started by the udev rule, by
+# boot and resume while wake is on, and by a shortcut through polkit. Ordered
+# after multi-user.target, which would otherwise wait for this oneshot and hold
+# up boot; after the sleep targets, so it runs on resume.
+[Unit]
+Description=Switch monitors to this machine
+After=systemd-modules-load.service multi-user.target {targets}
+
+[Service]
+Type=oneshot
+ExecStart=/{PROGRAM} switch
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target {targets}
+"""
+
+
+POLKIT_TEXT = f"""\
+// Written by uswitch install (SPEC.md D10): lets the active local user start
+// {UNIT_NAME} from a shortcut without a password. Switching inputs is the
+// whole of what it grants.
+polkit.addRule(function(action, subject) {{
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "{UNIT_NAME}" &&
+        action.lookup("verb") == "start" &&
+        subject.local && subject.active) {{
+        return polkit.Result.YES;
+    }}
+}});
+"""
+
+MODULES_LOAD_TEXT = "# Written by uswitch install: ddcutil needs /dev/i2c-* (SPEC.md D4).\ni2c-dev\n"
+
+
+# --- DDC/CI through ddcutil ---------------------------------------------------
+
+
+def parse_getvcp(text):
+    """The input source's low byte from `ddcutil --terse getvcp 60`, or None."""
+    m = re.search(r"^VCP\s+60\s+\S+(.*)$", text, re.MULTILINE | re.IGNORECASE)
+    if not m:
+        return None
+    values = re.findall(r"x([0-9a-fA-F]+)", m.group(1))
+    if not values:
+        return None
+    return int(values[-1], 16) & 0xFF
+
+
+class Ddc:
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def _run(self, connector, args):
+        try:
+            return self.ctx.command(["ddcutil", *connector.ddcutil_args(), *args])
+        except MissingCommand:
+            raise UswitchError(f"ddcutil is not installed; {DDCUTIL_PACKAGE_HINT}")
+
+    def get_input(self, connector):
+        """(value, None), or (None, why) when the monitor didn't answer."""
+        r = self._run(connector, ["--terse", "getvcp", INPUT_SOURCE])
+        if r.returncode != 0:
+            return None, r.message()
+        value = parse_getvcp(r.stdout)
+        if value is None:
+            return None, f"unexpected ddcutil output: {r.stdout.strip()[:80]!r}"
+        return value, None
+
+    def set_input(self, connector, value):
+        """None, or why the write failed."""
+        r = self._run(connector, ["setvcp", INPUT_SOURCE, f"0x{value:02x}"])
+        return None if r.returncode == 0 else r.message()
+
+
+# --- Switching (D10, D11, D12) -----------------------------------------------
+
+
+def present(config, connectors):
+    """(monitor, connector) for each configured monitor that is connected."""
+    pairs = []
+    for m in config.monitors:
+        for c in connectors:
+            if m.matches(c.edid):
+                pairs.append((m, c))
+                break
+    return pairs
+
+
+def desk_check(desk, devices, force):
+    """Whether a desk may switch now: a desk with a switch only while the
+    switch points here (D11)."""
+    return force or desk.usb is None or desk.usb.present(devices)
+
+
+@dataclass
+class MonitorRun:
+    monitor: Monitor
+    seen_at: object = None
+    written: bool = False
+    attempt_at: object = None
+    done: str = ""  # "already", "confirmed" or "unconfirmed"
+    error: str = ""
+    held: bool = False  # the desk check failed when it was last looked at
+
+    def restart(self):
+        """Forget every write and verdict: the switch moved, so what this run did
+        or saw before no longer says where the monitor is (D12)."""
+        self.done, self.written, self.attempt_at, self.error = "", False, None, ""
+
+
+def switch(ctx, config, force=False, dry_run=False):
+    """Switch this desk's connected monitors to this machine. Returns the exit status."""
+    clock, timing = ctx.clock, ctx.timing
+    start = clock.now()
+    if not config.monitors:
+        ctx.say("No desk learned yet: run `sudo uswitch learn`.")
+        return 0
+    while True:
+        pairs = present(config, connected_monitors(ctx.sysfs))
+        if pairs or dry_run or clock.now() - start >= timing.appear:
+            break
+        clock.sleep(timing.poll)
+    if not pairs:
+        ctx.say(f"No learned monitor appeared within {timing.appear:g}s: not at a learned desk.")
+        return 0
+    desks = sorted({m.desk for m, _ in pairs})
+    ctx.say(f"At desk {', '.join(desks)} after {clock.now() - start:.1f}s.")
+    ddc = Ddc(ctx)
+    if dry_run:
+        return _dry_run(ctx, config, ddc, pairs, force)
+    runs = [MonitorRun(m) for m in config.monitors if m.desk in desks]
+    usb_desks = [d for d in desks if config.desks[d].usb]
+    generations = {}
+
+    def notice_presses(devices):
+        """Start over every monitor at a desk whose switch went away and came back."""
+        pressed = False
+        for name in usb_desks:
+            now_here = config.desks[name].usb.generation(devices)
+            if name in generations and now_here and now_here != generations[name]:
+                pressed = True
+                for r in runs:
+                    if r.monitor.desk == name:
+                        r.restart()
+            generations[name] = now_here
+        return pressed
+
+    while True:
+        now = clock.now()
+        connectors = connected_monitors(ctx.sysfs)
+        devices = usb_devices(ctx.sysfs) if usb_desks else {}
+        if notice_presses(devices):
+            ctx.say("The switch went away and came back; checking the monitors again.")
+        for r in runs:
+            connector = next((c for c in connectors if r.monitor.matches(c.edid)), None)
+            if connector is None:
+                continue
+            if r.seen_at is None:
+                r.seen_at = now
+                if now - start >= timing.poll:
+                    ctx.say(f"{r.monitor.label}: reachable after {now - start:.1f}s.")
+            desk = config.desks[r.monitor.desk]
+            r.held = not desk_check(desk, devices, force)
+            if r.held:
+                # The switch moved on: start over, so a press back while the run
+                # still goes lands whatever this monitor's state was (D12).
+                r.restart()
+            elif not r.done:
+                # The snapshot above is older than the read _step makes first, so
+                # it looks again right before writing (D12).
+                _step(ctx, ddc, r, connector, lambda d=desk: desk_check(d, usb_devices(ctx.sysfs) if d.usb else {}, force))
+        if clock.now() - start >= timing.run:
+            break
+        if all(r.done for r in runs):
+            # A press away and back during the steps above would be lost once this
+            # run ends, folded into it by systemd: look once more before leaving.
+            if not usb_desks or not notice_presses(usb_devices(ctx.sysfs)):
+                break
+            ctx.say("The switch went away and came back; checking the monitors again.")
+            continue
+        clock.sleep(timing.poll)
+    status = 0
+    for r in runs:
+        if r.done:
+            continue
+        if r.seen_at is None:
+            ctx.say(f"{r.monitor.label}: not connected within {timing.run:g}s; skipped.")
+        elif r.held:
+            ctx.say(f"{r.monitor.label}: the switch points at another machine; left alone.")
+        elif r.error:
+            ctx.warn(f"{r.monitor.label}: not switched: {r.error}")
+            status = 1
+        else:
+            ctx.warn(f"{r.monitor.label}: never showed input {input_name(r.monitor.input)} within {timing.run:g}s.")
+            status = 1
+    return status
+
+
+def _step(ctx, ddc, r, connector, may_write):
+    """One look at one monitor: read before write, confirm after, and the
+    desk checked again right before any write (D12). Times come from the
+    clock when they're used, since a DDC/CI call can take seconds."""
+    m, timing = r.monitor, ctx.timing
+    value, why = ddc.get_input(connector)
+    now = ctx.clock.now()
+    if value == m.input:
+        if r.attempt_at is not None:
+            r.done = "confirmed"
+            ctx.say(f"{m.label}: showing {input_name(m.input)}, confirmed {now - r.attempt_at:.1f}s after writing.")
+        else:
+            r.done = "already"
+            ctx.say(f"{m.label}: already showing {input_name(m.input)}.")
+        return
+    if r.attempt_at is not None and now - r.attempt_at < timing.settle:
+        return  # still settling after the last attempt
+    if r.written and value is None:
+        r.done = "unconfirmed"
+        ctx.say(f"{m.label}: wrote {input_name(m.input)}; it doesn't answer reads to confirm ({why}).")
+        return
+    if not may_write():
+        r.held = True
+        return
+    shown = "no answer" if value is None else input_name(value)
+    ctx.say(f"{m.label}: {shown}; writing {input_name(m.input)}.")
+    error = ddc.set_input(connector, m.input)
+    r.attempt_at = ctx.clock.now()  # the monitor starts settling once the write is done
+    if error:
+        r.error = error
+        ctx.warn(f"{m.label}: write failed: {error}")
+    else:
+        r.written = True
+        r.error = ""
+
+
+def _dry_run(ctx, config, ddc, pairs, force):
+    devices = usb_devices(ctx.sysfs)
+    for m, c in pairs:
+        desk = config.desks[m.desk]
+        value, why = ddc.get_input(c)
+        if not desk_check(desk, devices, force):
+            plan = "would leave it: the switch points at another machine"
+        elif value == m.input:
+            plan = "already showing this machine"
+        else:
+            plan = f"would write {input_name(m.input)}"
+        shown = input_name(value) if value is not None else f"no answer ({why})"
+        ctx.say(f"{m.label}: {shown}; {plan}.")
+    return 0
+
+
+# --- Learning (D2) -----------------------------------------------------------
+
+
+def _next_desk_name(config):
+    n = 1
+    while f"desk{n}" in config.desks:
+        n += 1
+    return f"desk{n}"
+
+
+def watch_press(ctx, before):
+    """Wait for devices to leave and come back; returns those that did."""
+    clock, timing = ctx.clock, ctx.timing
+    start = clock.now()
+    gone = {}
+    while not gone:
+        if clock.now() - start >= timing.learn_press:
+            raise UswitchError(f"no USB device left within {timing.learn_press:g}s; was the switch pressed?")
+        clock.sleep(timing.poll)
+        current = usb_devices(ctx.sysfs)
+        gone = {p: d for p, d in before.items() if current.get(p) != d}
+    first_back = None
+    while True:
+        current = usb_devices(ctx.sysfs)
+        gone.update({p: d for p, d in before.items() if current.get(p) != d})
+        back = [d for p, d in gone.items() if current.get(p) == d]
+        now = clock.now()
+        if back and first_back is None:
+            first_back = now
+        if back and len(back) == len(gone):
+            return back
+        if first_back is not None and now - first_back >= timing.learn_return_grace:
+            return back
+        if now - start >= 2 * timing.learn_press:
+            raise UswitchError("the USB devices didn't come back; press the switch back to this machine and rerun learn")
+        clock.sleep(timing.poll)
+
+
+def _pick(ctx, devices, why):
+    if len(devices) == 1:
+        return devices[0]
+    ctx.say(why)
+    for i, d in enumerate(devices, 1):
+        ctx.say(f"  {i}. {d.describe()}")
+    while True:
+        answer = ctx.ask("Which one?", "1")
+        if answer.isdigit() and 1 <= int(answer) <= len(devices):
+            return devices[int(answer) - 1]
+        ctx.say(f"Answer a number from 1 to {len(devices)}.")
+
+
+def _usb_from_spec(ctx, spec, devices):
+    parts = spec.split(":", 2)
+    ids = [p.lower() for p in parts[:2]]
+    if len(parts) < 2 or not all(HEX4.fullmatch(p) for p in ids):
+        raise UswitchError("--usb takes VENDOR:PRODUCT or VENDOR:PRODUCT:SERIAL, in hex", code=2)
+    wanted = UsbTrigger(ids[0], ids[1], parts[2] if len(parts) == 3 else "")
+    matches = sorted((d for d in devices.values() if wanted.matches(d)), key=lambda d: d.port)
+    if not matches:
+        raise UswitchError(f"no USB device {wanted.describe()} is connected; point the switch at this machine")
+    return _pick(ctx, matches, "More than one device matches; pick the switch's own:")
+
+
+def _prove(ctx, ddc, pairs, label_away):
+    """Step 4: from an input the monitors aren't showing, switch them back."""
+    clock, timing = ctx.clock, ctx.timing
+    start = clock.now()
+    away = set()
+    while len(away) < len(pairs) and clock.now() - start < timing.learn_away:
+        for m, c in pairs:
+            if m.label in away:
+                continue
+            value, _ = ddc.get_input(c)
+            if value != m.input:
+                away.add(m.label)  # another input, or no answer on an input it isn't showing
+        if len(away) < len(pairs):
+            clock.sleep(timing.poll)
+    for m, c in pairs:
+        error = ddc.set_input(c, m.input)
+        if error:
+            ctx.warn(f"{m.label}: write failed: {error}")
+    start = clock.now()
+    pending = {m.label for m, _ in pairs}
+    while pending and clock.now() - start < timing.settle:
+        for m, c in pairs:
+            if m.label in pending and ddc.get_input(c)[0] == m.input:
+                pending.discard(m.label)
+        if pending:
+            clock.sleep(timing.poll)
+    ok = True
+    for m, _ in pairs:
+        if m.label in pending:
+            ok = False
+            ctx.warn(f"{m.label}: didn't come back. Use its buttons; it can't be switched from an inactive input (SPEC.md Phase 0 step 3).")
+        elif m.label in away:
+            ctx.say(f"{m.label}: {label_away}")
+        else:
+            ctx.say(f"{m.label}: never left this machine's input, so switching from another input is untested.")
+    return ok
+
+
+def learn(ctx, desk_name=None, usb_spec=None):
+    require_root(ctx)
+    config_path = ctx.path(CONFIG)
+    config = load_config(config_path) or Config()
+    ddc = Ddc(ctx)
+    pairs = []
+    for c in connected_monitors(ctx.sysfs):
+        probe = monitor_from_edid(c.edid, "", 0)
+        if any(m.same_monitor(probe) for m, _ in pairs):
+            ctx.warn(f"{probe.label}: identical to another connected monitor, with no serial to tell them apart; skipping it.")
+            continue
+        value, why = ddc.get_input(c)
+        if value is None:
+            ctx.say(f"{probe.label}: doesn't answer DDC/CI ({why}); skipping it.")
+            continue
+        probe.input = value
+        ctx.say(f"{probe.label}: showing {input_name(value)}, this machine's input.")
+        pairs.append((probe, c))
+    if not pairs:
+        raise UswitchError("no connected monitor answers DDC/CI; check its DDC/CI setting and `ddcutil detect`")
+    monitors = [m for m, _ in pairs]
+    owners = sorted({o.desk for o in config.monitors for m in monitors if o.same_monitor(m)})
+    if desk_name is None:
+        desk_name = ctx.ask("Name this desk:", owners[0] if len(owners) == 1 else _next_desk_name(config))
+    if not DESK_NAME.fullmatch(desk_name):
+        raise UswitchError("desk names are letters, digits, '.', '_' and '-'", code=2)
+    devices = usb_devices(ctx.sysfs)
+    if usb_spec:
+        setup_a = True
+    else:
+        while True:
+            answer = ctx.ask("Does this desk have a USB switch (a), or is a monitor its own switch (b)?", "a").lower()
+            if answer in ("a", "b"):
+                break
+        setup_a = answer == "a"
+    away_hint = (
+        f"After pressing it back, if the monitors didn't follow to the other machine, switch each one\n"
+        f"to another input with its buttons within {ctx.timing.learn_away:g}s; uswitch switches it back."
+    )
+    usb = None
+    if setup_a and usb_spec:
+        usb = trigger_for(_usb_from_spec(ctx, usb_spec, devices), devices)
+        ctx.say(f"Within {ctx.timing.learn_away:g}s, switch each monitor to another input with its buttons;")
+        ctx.say("uswitch then switches it back.")
+        ctx.ask("Press Enter to start.")
+    elif setup_a:
+        ctx.say("Press the USB switch to another machine, then press it back. The screen and keyboard")
+        ctx.say("may go to the other machine in between; nothing here needs a key until they're back.")
+        ctx.say(away_hint)
+        ctx.ask("Press Enter, then press the switch.")
+        returned = watch_press(ctx, usb_devices(ctx.sysfs))
+        devices = usb_devices(ctx.sysfs)
+        device = _pick(ctx, trigger_candidates(returned), "More than one device came and went with the switch; pick its own hub:")
+        usb = trigger_for(device, devices)
+    else:
+        ctx.say(f"Within {ctx.timing.learn_away:g}s, switch each monitor to another input with its buttons. Its KVM")
+        ctx.say("takes the keyboard with it; uswitch switches it back, and the keyboard returns.")
+        ctx.ask("Press Enter to start.")
+    if usb:
+        pinned = " (port pinned: the ID alone isn't unique, or its serial isn't safe to match)" if usb.port else ""
+        ctx.say(f"Trigger: {usb.describe()}{pinned}.")
+    config = replace_desk(config, desk_name, usb, monitors)
+    write_file(config_path, config_text(config))
+    write_rules(ctx, config)
+    ctx.say(f"Wrote desk {desk_name} to /{CONFIG} and the udev rule.")
+    ok = _prove(ctx, ddc, pairs, "switched back from another input.")
+    return 0 if ok else 1
+
+
+def systemctl_path(ctx):
+    return ctx.which("systemctl") or "/usr/bin/systemctl"
+
+
+def write_rules(ctx, config):
+    write_file(ctx.path(UDEV_RULE), udev_rules_text(config, systemctl_path(ctx)))
+    if ctx.live:
+        _check(ctx, ["udevadm", "control", "--reload"])
+
+
+def _check(ctx, argv):
+    try:
+        r = ctx.command(argv)
+    except MissingCommand as e:
+        raise UswitchError(str(e))
+    if r.returncode != 0:
+        raise UswitchError(f"{' '.join(argv)} failed: {r.message()}")
+
+
+def _systemctl(ctx, *args):
+    root = [] if ctx.live else ["--root", ctx.root]
+    _check(ctx, ["systemctl", *root, *args])
+
+
+# --- Install and uninstall (D9) ----------------------------------------------
+
+
+def install(ctx):
+    require_root(ctx)
+    if ctx.which("ddcutil") is None:
+        raise UswitchError(f"ddcutil is not installed; {DDCUTIL_PACKAGE_HINT}")
+    program = ctx.path(PROGRAM)
+    if not (os.path.exists(program) and os.path.samefile(ctx.self_path, program)):
+        os.makedirs(os.path.dirname(program), exist_ok=True)
+        write_file(program, _read(ctx.self_path), 0o755)
+    write_file(ctx.path(UNIT), unit_text())
+    write_file(ctx.path(POLKIT_RULE), POLKIT_TEXT)
+    write_file(ctx.path(MODULES_LOAD), MODULES_LOAD_TEXT)
+    config = load_config(ctx.path(CONFIG))
+    if ctx.live:
+        _check(ctx, ["modprobe", "i2c-dev"])
+        _check(ctx, ["systemctl", "daemon-reload"])
+    if config is not None:
+        write_rules(ctx, config)
+    wake = config.wake if config is not None else True
+    _systemctl(ctx, "enable" if wake else "disable", UNIT_NAME)
+    ctx.say(f"Installed /{PROGRAM}, {UNIT_NAME} (wake {'on' if wake else 'off'}), its polkit rule and i2c-dev loading.")
+    if config is None:
+        ctx.say("No desk learned yet; running `uswitch learn`.")
+        return learn(ctx)
+    return 0
+
+
+def uninstall(ctx, purge=False):
+    require_root(ctx)
+    if os.path.exists(ctx.path(UNIT)):
+        _systemctl(ctx, "disable", UNIT_NAME)
+    paths = [UDEV_RULE, UNIT, POLKIT_RULE, MODULES_LOAD, PROGRAM] + ([CONFIG] if purge else [])
+    removed = []
+    for rel in paths:
+        try:
+            os.remove(ctx.path(rel))
+            removed.append(f"/{rel}")
+        except FileNotFoundError:
+            pass  # already gone: uninstall is idempotent
+    if ctx.live:
+        _check(ctx, ["systemctl", "daemon-reload"])
+        _check(ctx, ["udevadm", "control", "--reload"])
+    ctx.say("Removed " + (", ".join(removed) if removed else "nothing; uswitch wasn't installed") + ".")
+    if not purge and os.path.exists(ctx.path(CONFIG)):
+        ctx.say(f"Kept /{CONFIG}; `uninstall --purge` removes it too.")
+    return 0
+
+
+# --- Status -------------------------------------------------------------------
+
+
+def status(ctx):
+    config = load_config(ctx.path(CONFIG))
+    if config is None:
+        ctx.say("No desk learned yet: run `sudo uswitch learn`.")
+        return 0
+    connectors = connected_monitors(ctx.sysfs)
+    devices = usb_devices(ctx.sysfs)
+    pairs = dict((m.label, c) for m, c in present(config, connectors))
+    can_read = not ctx.live or ctx.euid == 0
+    ddc = Ddc(ctx)
+    ctx.say(f"wake: {'on' if config.wake else 'off'}")
+    for name in sorted(config.desks):
+        desk = config.desks[name]
+        here = any(m.label in pairs for m in config.monitors_of(name))
+        if desk.usb:
+            setup = f"USB switch {desk.usb.describe()}, {'present' if desk.usb.present(devices) else 'not present'}"
+        else:
+            setup = "the monitor is the switch"
+        ctx.say(f"desk {name}{' (connected)' if here else ''}: {setup}")
+        for m in config.monitors_of(name):
+            c = pairs.get(m.label)
+            if c is None:
+                state = "not connected"
+            elif not can_read:
+                state = "connected (current input needs sudo)"
+            else:
+                value, why = ddc.get_input(c)
+                state = f"showing {input_name(value)}" if value is not None else f"no answer ({why})"
+            ctx.say(f"  {m.label}: this machine is {input_name(m.input)}; {state}")
+    return 0
+
+
+# --- Command line -------------------------------------------------------------
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="uswitch", description="Switch monitors to this machine over DDC/CI.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("install", help="install, then learn if no desk is learned (D9)")
+    p = sub.add_parser("uninstall", help="remove what install and learn wrote (D9)")
+    p.add_argument("--purge", action="store_true", help="remove the configuration too")
+    p = sub.add_parser("learn", help="learn this desk's trigger and monitor inputs (D2)")
+    p.add_argument("--desk", metavar="NAME", help="the desk's name")
+    p.add_argument("--usb", metavar="VENDOR:PRODUCT[:SERIAL]", help="name the switch's hub instead of pressing it")
+    p = sub.add_parser("switch", help="switch the connected monitors to this machine (D10)")
+    p.add_argument("--dry-run", action="store_true", help="say what would change, and change nothing")
+    p.add_argument("--force", action="store_true", help="skip the desk check (D11)")
+    sub.add_parser("status", help="show desks, triggers and monitor inputs")
+    return parser.parse_args(argv)
+
+
+def main(argv=None, ctx=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    ctx = ctx or Context()
+    try:
+        if args.command == "install":
+            return install(ctx)
+        if args.command == "uninstall":
+            return uninstall(ctx, args.purge)
+        if args.command == "learn":
+            return learn(ctx, args.desk, args.usb)
+        if args.command == "switch":
+            require_root(ctx)
+            config = load_config(ctx.path(CONFIG)) or Config()
+            return switch(ctx, config, force=args.force, dry_run=args.dry_run)
+        return status(ctx)
+    except UswitchError as e:
+        ctx.warn(str(e))
+        return e.code
+    except OSError as e:
+        ctx.warn(f"{e.filename or 'file'}: {e.strerror or e}")
+        return 1
+    except KeyboardInterrupt:
+        ctx.warn("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
