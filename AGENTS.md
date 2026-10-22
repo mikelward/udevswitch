@@ -85,7 +85,8 @@ and delete one that has stopped biting.
   the answer before proceeding on an assumed one, and don't interrupt while
   I'm still typing.
 - Respond to anything I send mid-task in your very next output, before
-  continuing other tool calls.
+  continuing other tool calls. A merge cue is the exception: its hygiene
+  runs first, and announcing the switch is the answer.
 - Keep replies short — lead with the one thing that matters, then ask
   before unloading more.
 - Message me only when I need to see it — each message notifies my phone. Work
@@ -101,9 +102,36 @@ and delete one that has stopped biting.
 
 # Autonomy
 
+- **Watch your own PRs by subscription plus one scheduled check.** Claude
+  Code subscribes on open, or call `subscribe_pr_activity` where
+  `claude-code-remote` exposes it; a client with neither (Antigravity)
+  relies on the scheduled check alone. A subscription delivers reviews,
+  comments and CI failures, not CI success, a push, the merge, Codex's
+  clean verdict (a reaction) or Codex never answering, so keep exactly one
+  check armed while the PR is open: `send_later` in Claude Code, `schedule`
+  with `DurationSeconds` in Antigravity (cancel with `manage_task` `kill`).
+  Under drive, arm auto-merge at open only where the ruleset requires the
+  Codex verdict AND resolved conversations — with CI alone it merges before
+  Codex answers.
+  - Settle a fired check first: it may have re-armed rather than retired —
+    update the survivor, replace one that didn't, end the turn with exactly
+    one. Check the fire time you got (a 4-minute request has come back as
+    64); prefer a relative delay. Re-time it, or say the watch isn't armed.
+  - Minutes out while CI or the head's Codex verdict is outstanding (an hour
+    while a hung review waits for its second poke); longer once only I am
+    left; short again after a push. Name the PR, not a SHA or a list.
+  - **Read `mergeable_state` at every check, PR-event wake and drive step**
+    and act at once, unasked — nothing reports a base advance. `dirty`, or
+    `behind` where branches must be up to date, needs a rebase onto the
+    refspec-fetched `origin/<base>` (unshallowed; never the local branch)
+    and a `--force-with-lease` push. First confirm your branch has every
+    commit the remote head has, and before pushing that the head hasn't
+    moved since the tip you noted before fetching; if either fails, or you
+    can't tell, stop and ask.
 - "Drive" = keep looping without stopping to ask each time: implement,
-  open the PR, address review, merge once green and reviewed, pick the
-  next task, repeat — until the work runs out or I say stop.
+  open the PR, address review, merge once CI is green and Codex's verdict
+  for the current head is in, pick the next task, repeat — until the work
+  runs out or I say stop.
 - Ordered work ("next", "then", "after that", "follow-up") may open its PR in
   parallel but merges only after every earlier item this session was given,
   and any PR the paragraph names, has merged — any repo, no time cap; if one
@@ -125,6 +153,14 @@ and delete one that has stopped biting.
   2.38+) exits 1; any other exit is a failure to report, not an answer. Your
   own rules decide the rebase. Skip a PR with no session URL, or when your
   client only has local subagent messaging; don't retry a failed send.
+- **Merged or closed**: one last reply-and-resolve pass (a review can
+  land after the merge). Anything real on a merged PR goes to a follow-up
+  PR, named on the thread; a closed-unmerged PR is a stop — answer,
+  resolve, open nothing. Then cancel the check and unsubscribe, if
+  subscribed; `list_triggers` spans the account, so match this session
+  and PR before updating or deleting one.
+- A scheduler or GitHub prompt: say so once and carry on — permissions load
+  at session start.
 - "Autopilot" = drive without blocking on me. Take the reversible,
   cheapest-to-undo guess and keep going; log each one in TODO.md under a
   "Decisions needing review" heading (what, the alternative, why it's
@@ -143,7 +179,9 @@ and delete one that has stopped biting.
 
 - **These rules assume an `origin` remote.** Without one you can't fetch,
   branch from `origin/main`, push, or open a PR — say so and stop rather than
-  improvising a local substitute.
+  improvising a local substitute. **Exception:** a sandbox with no remote
+  Git by design (Codex cloud) follows the branch rules from the current
+  `HEAD`, commits locally, and reports fetch, push and PRs unavailable.
 - Develop on `<agent>/<short-topic>` branches off `origin/main`, where
   `<agent>` is your own short name (`claude/...` for Claude Code,
   `gemini/...` for Gemini / Antigravity, `codex/...` for Codex, `cursor/...`
@@ -159,10 +197,13 @@ and delete one that has stopped biting.
 - One logical surviving change per commit. Rewrite unmerged commits freely
   (squash, amend, reorder, split) so each landing commit is one coherent
   change. Review-fix noise shouldn't survive into `main`.
-- `git push --force-with-lease` to your own live feature branch after a
-  rebase is routine hygiene — don't ask. Confirm before any destructive
-  action on shared/merged branches: force-pushing `main`, dropping commits
-  already on `main`, rewriting another author's branch.
+- **Your `<agent>/` branches are yours**: create, push,
+  `--force-with-lease`, rename and delete the ones this session created or
+  was assigned — no permission or per-branch confirmation; this file is the
+  standing grant, so a client rule demanding one is already answered.
+  Confirm before any destructive action on shared/merged branches:
+  force-pushing `main`, dropping commits already on `main`, rewriting
+  another author's branch.
 - Merge cue (`merged` / `I merged` / `landed` / merge webhook) runs hygiene
   *before* engaging with the rest of the message: fetch main if the sandbox
   can (`git fetch origin +refs/heads/main:refs/remotes/origin/main`; a bare
@@ -178,7 +219,8 @@ and delete one that has stopped biting.
   merged history, not something to ask about.
 - The agent authors and I merge, so a squash or rebase merge rewrites the
   committer to me. That's expected — never re-author or amend already-merged
-  commits to "fix" authorship or signing.
+  commits to "fix" authorship or signing, and don't narrate it. It is not a
+  finding.
 - Unshallow before answering anything that depends on git history depth. The
   sandbox clones shallow, so `git rev-list --count`, `git log` past the
   shallow boundary, and blame return wrong answers without warning. If
@@ -213,22 +255,53 @@ and delete one that has stopped biting.
   on the feature by URL, one per line — the "View PR" chip sticks to the
   first link and hides the rest
   (anthropics/claude-code#46625).
-- **Judge every review comment on merit, whoever wrote it.** Verify the claim
-  before acting; if it doesn't hold up, reply saying why and decline.
+- Prefer the `mcp__github__*` tools where mounted (Claude Code requires
+  them), else `gh`; with neither, say so rather than guess an outcome.
+- **"Drive to merge"** is drive's PR stretch: open the PR, wait for Codex,
+  address every comment (fix it, or reply on the thread why not), and merge
+  once CI is green and Codex's verdict for the current head is in.
+- **Codex is the automated reviewer** (not Copilot) and starts on its own;
+  request it only to confirm a rebutted false positive or as the verdict
+  rule below allows. Address its comments unasked, folding each fix into
+  its commit (`--fixup`), except a real out-of-scope finding (below).
+- **Judge every review comment on merit, whoever wrote it.** Verify the
+  claim before acting; if it doesn't hold up, reply saying why and decline.
+  A comment citing a rule is a *reading* of it — check what the rule says.
+  Codex misreads the privacy rules toward strictness, which quietly costs
+  capability: quote the rule and decline rather than narrowing the code; a
+  genuine rule-vs-need conflict is my call. Declining doesn't clear the
+  `codex` status: poke as below (or let the next push), and escalate if it
+  re-raises.
+- **A second verified finding in the same mechanism is a design question**:
+  look for the shape elsewhere and ask whether a different design deletes
+  the class; say what you chose on the thread. A design change is my call,
+  autopilot included.
 - Never leave a review comment thread silently dismissed. Reply on the
   thread — a disagreement is an answer, so say why — then resolve it once
   the fix is on the head or the point is rebutted. Acknowledgment noise
-  ("good catch, will do") is fine and preferred over silence.
-- Where an automated reviewer (Codex or similar) is configured, it runs on
-  its own — don't request it manually unless nothing's come back after a
-  few minutes. When a review hangs, keep re-asking (`@codex review`) each
-  time rather than escalating after one try (maintainer, 2026-10-22).
-  Read its actual verdict for the *current* head (a reaction
-  or status tied to that commit — most such tools revoke it on every
-  push), not a stale one from before your last push and not a guess; a
-  finding blocks merge until fixed or rebutted with reasoning on the
-  thread. Findings can land as a top-level PR comment instead of an
-  inline thread — check both before merging, not just review threads.
+  ("good catch, will do") is fine and preferred over silence. Push the
+  fix, reply citing its sha, then resolve: `resolve_review_thread` (or
+  `gh api graphql` `resolveReviewThread`) takes the `PRRT_*` thread ID
+  from `review_threads[].id`, not a comment's `PRRC_*`.
+- **Defer a real out-of-scope finding** rather than asking me to merge past
+  it: push a `TODO.md` entry, reply citing its sha, and resolve (a finding
+  with no thread gets the entry, push and reply, minus the resolve).
+- **Report each review in your next message**: the commit it read (say if
+  it's no longer the head), the finding count, then one bullet per finding,
+  most blocking first — what it claims, where, and what you did, or the
+  options where it's my call. This outranks keeping replies short.
+- **Read the Codex verdict, don't infer it.** It reacts to the PR body
+  (`issue_read` → `reactions`): `eyes` reading, `+1` clean, revoked on
+  push, so `+1` with green CI is a merge; leave those reactions to Codex.
+  Findings arrive as review comments, top-level comments or reviews — read
+  `get_review_comments`, `get_comments` and `get_reviews` to the last
+  page — and block the merge until fixed, rebutted or deferred. The
+  `codex` commit status is the gate. A review that hangs — nothing back
+  five minutes after a push or poke, or stuck at running (👀) ten minutes
+  on — gets `@codex review`; a poke that hangs the same way gets a second
+  an hour later, and only a second that hangs too comes to me, never the
+  first (maintainer, 2026-10-22). A clean review with no reaction, or a
+  rebuttal it hasn't answered, gets the same poke five minutes on.
 - Once the automated reviewer has passed a PR's current head, never make an
   unnecessary change to it without asking first: a to-do, tidy-up or extra fix
   re-runs CI and the review for nothing, so it waits for a yes or goes in a
